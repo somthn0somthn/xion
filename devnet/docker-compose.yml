@@ -1,6 +1,6 @@
 services:
   xion:
-    image: burnt/xion:develop
+    image: burnt/xion:develop    
     build:
       context: ../
       dockerfile: Dockerfile

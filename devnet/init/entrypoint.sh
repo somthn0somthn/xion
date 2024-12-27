@@ -50,6 +50,10 @@ initialize_chain(){
 
     ${DAEMON_NAME} init ${validator} --chain-id=${CHAIN_NAME} \
     ${ADD_INIT_FLAGS} > /dev/null 2>&1
+
+    #I ADDED THIS LINE
+    #sed -i 's|cors_allowed_origins = \[\]|cors_allowed_origins = ["*"]|' \
+    #    ${DAEMON_HOME}/config/config.toml
 }
 
     # initialize an accounts
