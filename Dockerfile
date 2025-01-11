@@ -1,177 +1,75 @@
 # syntax=docker/dockerfile:1
 
-ARG GO_VERSION="1.22"
-ARG ALPINE_VERSION="3.20"
+# ------------------------------------------------------
+# 1) Builder stage
+# ------------------------------------------------------
+FROM golang:1.22-alpine3.20 AS builder
 
-# --------------------------------------------------------
-# Builder
-# --------------------------------------------------------
+# Enable CGO, specify a musl-based toolchain, and build tags for CosmWasm
+ENV CGO_ENABLED=1
+ENV CC=gcc
+ENV LINK_STATICALLY=true
+ENV BUILD_TAGS=muslc
 
-FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder
+# Optionally adjust this if your code references a different version of wasmvm
+ENV WASMVM_VERSION="v2.1.2"
 
-# Always set by buildkit
-ARG TARGETPLATFORM
-ARG TARGETARCH
-ARG TARGETOS
-ARG XIOND_BINARY
-
-# needed in makefile
-ARG COMMIT
-ARG VERSION
-
-# Consume Args to env
-ENV COMMIT=${COMMIT} \
-    VERSION=${VERSION} \
-    GOOS=${TARGETOS} \
-    GOARCH=${TARGETARCH} \
-    XIOND_BINARY=${XIOND_BINARY}
-
-# Install dependencies
-RUN set -eux; \
-    apk add --no-cache \
-    build-base \
-    ca-certificates \
-    linux-headers \
-    binutils-gold \
-    git
-
-# Set the workdir
-WORKDIR /go/src/github.com/burnt-labs/xion
-
-# Download go dependencies
-COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    --mount=type=cache,target=/root/pkg/mod \
-    set -eux; \
-    go install cosmossdk.io/tools/cosmovisor/cmd/cosmovisor@v1.5.0; \
-    go mod download
-
-# Cosmwasm - Download correct libwasmvm version
-RUN set -eux; \
-    WASMVM_REPO="github.com/CosmWasm/wasmvm"; \
-    WASMVM_MOD_VERSION="$(grep ${WASMVM_REPO} go.mod | cut -d ' ' -f 1)"; \
-    WASMVM_VERSION="$(go list -m ${WASMVM_MOD_VERSION} | cut -d ' ' -f 2)"; \
-    [ ${TARGETPLATFORM} = "linux/amd64" ] && LIBWASM="libwasmvm_muslc.x86_64.a"; \
-    [ ${TARGETPLATFORM} = "linux/arm64" ] && LIBWASM="libwasmvm_muslc.aarch64.a"; \
-    [ ${TARGETOS} = "darwin" ] && LIBWASM="libwasmvmstatic_darwin.a"; \
-    [ -z "$LIBWASM" ] && echo "Arch ${TARGETARCH} not recognized" && exit 1; \
-    wget "https://${WASMVM_REPO}/releases/download/${WASMVM_VERSION}/${LIBWASM}" -O "/lib/${LIBWASM}"; \
-    # verify checksum
-    EXPECTED=$(wget -q "https://${WASMVM_REPO}/releases/download/${WASMVM_VERSION}/checksums.txt" -O- | grep "${LIBWASM}" | awk '{print $1}'); \
-    sha256sum "/lib/${LIBWASM}" | grep "${EXPECTED}"; \
-    cp /lib/${LIBWASM} /lib/libwasmvm_muslc.a;
-
-# Copy local files
+WORKDIR /app
 COPY . .
 
-# Build xiond binary
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    --mount=type=cache,target=/root/pkg/mod \
-    if [ -e "${XIOND_BINARY:-}" ]; then \
-        cp "${XIOND_BINARY}" /go/bin/xiond; \
-    else \
-        export CGO_ENABLED=1 LINK_STATICALLY=true BUILD_TAGS=muslc; \
-        make test-version; \
-        make install; \
-    fi
+# Install the Alpine packages needed to build a static musl binary
+RUN apk add --no-cache \
+    build-base \
+    binutils-gold \
+    musl-dev \
+    git \
+    wget
 
-# --------------------------------------------------------
-# Heighliner
-# --------------------------------------------------------
-
-# Build final image from scratch
-FROM scratch AS heighliner
-
-WORKDIR /bin
-ENV PATH=/bin
-
-# Install busybox
-COPY --from=busybox:1.36-musl /bin/busybox /bin/busybox
-
-# users and group
-COPY --from=busybox:1.36-musl /etc/passwd /etc/group /etc/
-
-# Install trusted CA certificates
-COPY --from=builder /etc/ssl/cert.pem /etc/ssl/cert.pem
-
-# Install xiond
-COPY --from=builder /go/bin/xiond /bin/xiond
-
-# Install jq
-COPY --from=ghcr.io/strangelove-ventures/infra-toolkit:v0.1.4 /usr/local/bin/jq /bin/jq
-
-# link shell
-RUN ["busybox", "ln", "/bin/busybox", "sh"]
-
-# Add hard links for read-only utils
-# Will then only have one copy of the busybox minimal binary file with all utils pointing to the same underlying inode
+# Download the musl-based "libwasmvm_muslc.x86_64.a" from the WasmVM repo
 RUN set -eux; \
-    for bin in \
-    cat \
-    date \
-    df \
-    du \
-    env \
-    grep \
-    head \
-    less \
-    ls \
-    md5sum \
-    pwd \
-    sha1sum \
-    sha256sum \
-    sha3sum \
-    sha512sum \
-    sleep \
-    stty \
-    tail \
-    tar \
-    tee \
-    tr \
-    watch \
-    which \
-    ; do busybox ln /bin/busybox $bin; \
-    done;
+    LIBWASM="libwasmvm_muslc.x86_64.a"; \
+    wget "https://github.com/CosmWasm/wasmvm/releases/download/${WASMVM_VERSION}/${LIBWASM}" \
+    -O "/lib/${LIBWASM}"; \
+    # rename/move it so the build can find it easily
+    cp "/lib/${LIBWASM}" "/lib/libwasmvm_muslc.a"
 
-RUN set -eux; \
-    busybox mkdir -p /tmp /home/heighliner; \
-    busybox addgroup --gid 1025 -S heighliner; \
-    busybox adduser --uid 1025 -h /home/heighliner -S heighliner -G heighliner; \
-    busybox chown 1025:1025 /tmp /home/heighliner; \
-    busybox unlink busybox;
+# Build with full static linkage
+# -linkmode external -extldflags "-static" forces a completely static binary
+RUN go build \
+    -tags "$BUILD_TAGS" \
+    -ldflags '-linkmode external -extldflags "-static"' \
+    -o xiond \
+    ./cmd/xiond
 
-WORKDIR /home/heighliner
-USER heighliner
 
-# --------------------------------------------------------
-# Runner
-# --------------------------------------------------------
+# ------------------------------------------------------
+# 2) Final stage: Minimal runtime image
+# ------------------------------------------------------
+FROM alpine:3.20
 
-FROM alpine:${ALPINE_VERSION} AS release
-COPY --from=builder /go/bin/xiond /usr/bin/xiond
-COPY --from=builder /go/bin/cosmovisor /usr/bin/cosmovisor
+# Copy the statically-linked xiond from the builder
+COPY --from=builder /app/xiond /usr/bin/xiond
 
-# api
-EXPOSE 1317
-# grpc
-EXPOSE 9090
-# p2p
-EXPOSE 26656
-# rpc
-EXPOSE 26657
-# prometheus
-EXPOSE 26660
+# Optional: install small debugging tools (bash, jq)
+RUN apk add --no-cache bash jq \
+    && mkdir -p /var/cosmos-chain \
+    && chown -R 1000:1000 /var/cosmos-chain
 
-RUN set -euxo pipefail; \
-    apk add --no-cache bash openssl curl htop jq lz4 tini; \
-    addgroup --gid 1000 -S xiond; \
-    adduser --uid 1000 -S xiond \
-    --disabled-password \
-    --gecos xiond \
-    --ingroup xiond; \
-    mkdir -p /home/xiond; \
-    chown -R xiond:xiond /home/xiond
+WORKDIR /var/cosmos-chain
 
-USER xiond:xiond
-WORKDIR /home/xiond/.xiond
+# Common Cosmos ports: REST(1317), P2P(26656), RPC(26657), gRPC(9090)
+EXPOSE 1317 26656 26657 9090
+
+# Default command just runs xiond
 CMD ["/usr/bin/xiond"]
+
+##CONT There are funded addresses with the local-ic generation -- see chatgpt chats --
+##  but how are they funded and how can I manipulate this?
+
+################OLD NOTES#############
+
+
+##Try an ubuntu based buil
+
+##Maybe I need to take a step back and review what local-ic needs and why it
+##seems to be incompatible with XION Dockerfile
